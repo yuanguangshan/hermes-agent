@@ -1,11 +1,22 @@
-"""ACP agent server — exposes Hermes Agent via the Agent Client Protocol."""
+"""ACP agent server — exposes Hermes Agent via the Agent Client Protocol.
+
+Supports multi-modal prompts (text, images, audio, resources).  Images are
+passed through to AIAgent either as native ``image_url`` content blocks
+(for models with vision) or described via auxiliary vision (for text-only
+models) — mirroring the approach of the nanobot acp_adapter.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
+import os
+import re
+import tempfile
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Deque, Optional
 
 import acp
@@ -69,6 +80,20 @@ except Exception:
 # Thread pool for running AIAgent (synchronous) in parallel.
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="acp-agent")
 
+# ── Multi-modal prompt extraction ──────────────────────────────────────
+
+
+def _extract_markdown_images(text: str) -> tuple[str, list[tuple[str, str]]]:
+    """Extract markdown image URLs from text.
+
+    Returns:
+        (text_without_images, [(alt_text, url), ...])
+    """
+    pattern = r"!\[([^\]]*)\]\(([^)]+)\)"
+    matches: list[tuple[str, str]] = re.findall(pattern, text)
+    clean_text = re.sub(pattern, "", text).strip()
+    return clean_text, matches
+
 
 def _extract_text(
     prompt: list[
@@ -86,8 +111,174 @@ def _extract_text(
             parts.append(block.text)
         elif hasattr(block, "text"):
             parts.append(str(block.text))
-        # Non-text blocks are ignored for now.
     return "\n".join(parts)
+
+
+def _extract_prompt_parts(
+    prompt: list[
+        TextContentBlock
+        | ImageContentBlock
+        | AudioContentBlock
+        | ResourceContentBlock
+        | EmbeddedResourceContentBlock
+    ],
+) -> tuple[str, list[ImageContentBlock]]:
+    """Extract text AND image blocks from an ACP prompt.
+
+    Returns:
+        (text, image_blocks) where image_blocks is a list of
+        ImageContentBlock objects from the prompt.
+    """
+    text_parts: list[str] = []
+    images: list[ImageContentBlock] = []
+
+    for block in prompt:
+        if isinstance(block, TextContentBlock):
+            text_parts.append(block.text)
+        elif isinstance(block, ImageContentBlock):
+            images.append(block)
+        elif hasattr(block, "text"):
+            text_parts.append(str(getattr(block, "text", "")))
+
+    return "\n".join(text_parts), images
+
+
+async def _download_image(uri: str) -> tuple[str, str]:
+    """Download an image from a URL to a temp file.
+
+    Returns:
+        (local_path, mime_type)
+    """
+    import httpx
+
+    tmp_dir = Path(tempfile.gettempdir()) / "hermes_acp_images"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    suffix = ".jpg"
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        resp = await client.get(uri)
+        resp.raise_for_status()
+
+        content_type = resp.headers.get("content-type", "")
+        if "png" in content_type:
+            suffix = ".png"
+        elif "gif" in content_type:
+            suffix = ".gif"
+        elif "webp" in content_type:
+            suffix = ".webp"
+
+        tmp_path = tmp_dir / f"acp_img_{os.urandom(8).hex()}{suffix}"
+        tmp_path.write_bytes(resp.content)
+        logger.info("Downloaded image from %s → %s (%d bytes)", uri, tmp_path, len(resp.content))
+        return str(tmp_path), content_type or "image/jpeg"
+
+
+def _materialize_base64_image(data: str, mime_type: str) -> str:
+    """Write base64-encoded image data to a temp file.
+
+    Returns:
+        Local file path.
+    """
+    tmp_dir = Path(tempfile.gettempdir()) / "hermes_acp_images"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    suffix_map = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/gif": ".gif",
+        "image/webp": ".webp",
+        "image/bmp": ".bmp",
+    }
+    suffix = suffix_map.get(mime_type, ".jpg")
+    tmp_path = tmp_dir / f"acp_img_{os.urandom(8).hex()}{suffix}"
+
+    if data.startswith("data:"):
+        _, _, b64_data = data.partition(",")
+    else:
+        b64_data = data
+
+    tmp_path.write_bytes(base64.b64decode(b64_data))
+    logger.info("Materialized base64 image → %s (%d bytes)", tmp_path, tmp_path.stat().st_size)
+    return str(tmp_path)
+
+
+async def _describe_image_via_auxiliary(image_path: str) -> str:
+    """Use the auxiliary vision router to describe an image.
+
+    Falls back to a placeholder if the vision API is unavailable.
+    Returns a text description to inject into the prompt.
+    """
+    try:
+        from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
+    except ImportError:
+        logger.warning("Auxiliary vision not available, skipping image description")
+        return f"[无法读取图片内容: {os.path.basename(image_path)}]"
+
+    try:
+        from tools.vision_tools import _image_to_base64_data_url, _detect_image_mime_type
+        img_path = Path(image_path)
+        mime = _detect_image_mime_type(img_path)
+        if not mime:
+            return f"[非图片文件: {os.path.basename(image_path)}]"
+
+        data_url = _image_to_base64_data_url(img_path, mime_type=mime)
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "请用中文简要描述这张图片的内容。如果图片中有文字，请提取出来。"},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ]
+
+        response = await async_call_llm(
+            task="vision",
+            messages=messages,
+            temperature=0.1,
+            max_tokens=1024,
+            timeout=60,
+        )
+        description = extract_content_or_reasoning(response)
+        if description:
+            logger.info("Auxiliary vision description: %s", description[:100])
+            return description
+    except Exception:
+        logger.warning("Auxiliary vision failed for %s", image_path, exc_info=True)
+
+    return f"[图片识别失败: {os.path.basename(image_path)}]"
+
+
+def _build_user_content_with_images(
+    text: str, image_paths: list[tuple[str, str]]
+) -> str | list[dict]:
+    """Build user message content in OpenAI format with text and images.
+
+    Args:
+        text: User's text prompt
+        image_paths: List of (local_path, mime_type) tuples
+
+    Returns:
+        Either a plain string (no images) or a list of content blocks
+        compatible with OpenAI-format APIs.
+    """
+    if not image_paths:
+        return text or "(用户发送了内容)"
+
+    content: list[dict] = []
+    if text:
+        content.append({"type": "text", "text": text})
+
+    for local_path, mime_type in image_paths:
+        try:
+            from tools.vision_tools import _image_to_base64_data_url
+            data_url = _image_to_base64_data_url(Path(local_path), mime_type=mime_type)
+            content.append({"type": "image_url", "image_url": {"url": data_url}})
+        except Exception:
+            logger.warning("Failed to encode image %s for LLM", local_path, exc_info=True)
+
+    return content if content else [{"type": "text", "text": "(空内容)"}]
 
 
 class HermesACPAgent(acp.Agent):
@@ -361,17 +552,56 @@ class HermesACPAgent(acp.Agent):
         session_id: str,
         **kwargs: Any,
     ) -> PromptResponse:
-        """Run Hermes on the user's prompt and stream events back to the editor."""
+        """Run Hermes on the user's prompt and stream events back to the editor.
+
+        Supports multi-modal prompts including images.  Images are handled via
+        one of two paths:
+          1. **Native vision**: for models that support ``image_url`` content
+             blocks, the images are passed directly in the conversation history.
+          2. **Auxiliary vision**: for text-only models, images are described
+             using the auxiliary vision router and the descriptions are injected
+             into the text prompt (matching nanobot acp_adapter behaviour).
+        """
         state = self.session_manager.get_session(session_id)
         if state is None:
             logger.error("prompt: session %s not found", session_id)
             return PromptResponse(stop_reason="refusal")
 
-        user_text = _extract_text(prompt).strip()
-        if not user_text:
+        user_text, image_blocks = _extract_prompt_parts(prompt)
+        user_text = user_text.strip()
+
+        # ── Image handling ──────────────────────────────────────────────
+        image_paths: list[tuple[str, str]] = []  # (local_path, mime_type)
+        cleanup_paths: list[str] = []  # files to remove after this turn
+
+        for img_block in image_blocks:
+            try:
+                if img_block.uri:
+                    uri = img_block.uri
+                    if uri.startswith("file://"):
+                        local = uri[7:]
+                        image_paths.append((local, img_block.mime_type))
+                    else:
+                        local, mime = await _download_image(uri)
+                        image_paths.append((local, mime))
+                        cleanup_paths.append(local)
+                elif img_block.data:
+                    local = _materialize_base64_image(img_block.data, img_block.mime_type)
+                    image_paths.append((local, img_block.mime_type))
+                    cleanup_paths.append(local)
+            except Exception:
+                logger.warning("Failed to process image block", exc_info=True)
+
+        if image_paths:
+            logger.info(
+                "Prompt includes %d image(s): %s",
+                len(image_paths),
+                [os.path.basename(p) for p, _ in image_paths],
+            )
+
+        if not user_text and not image_paths:
             return PromptResponse(stop_reason="end_turn")
 
-        # Intercept slash commands — handle locally without calling the LLM
         if user_text.startswith("/"):
             response_text = self._handle_slash_command(user_text, state)
             if response_text is not None:
@@ -380,7 +610,32 @@ class HermesACPAgent(acp.Agent):
                     await self._conn.session_update(session_id, update)
                 return PromptResponse(stop_reason="end_turn")
 
-        logger.info("Prompt on session %s: %s", session_id, user_text[:100])
+        # ── Prepare user message content ────────────────────────────────
+        model = getattr(state.agent, "model", "") or ""
+        # Known text-only models (no vision capability)
+        text_only_prefixes = ("glm-4-turbo", "glm-4-flash", "glm-4-air")
+        has_vision = not any(model.lower().startswith(p) for p in text_only_prefixes)
+
+        user_message_content: str | list[dict] = user_text or "(用户发送了内容)"
+
+        if image_paths:
+            if has_vision:
+                user_message_content = _build_user_content_with_images(
+                    user_text, image_paths
+                )
+                logger.info("Images passed as native content blocks to %s", model)
+            else:
+                for img_path, _mime in image_paths:
+                    desc = await _describe_image_via_auxiliary(img_path)
+                    if desc:
+                        image_label = os.path.basename(img_path)
+                        user_message_content = (
+                            f"{user_message_content}\n\n"
+                            f"[图片描述 ({image_label}): {desc}]"
+                        )
+                logger.info("Images described via auxiliary vision for %s", model)
+
+        logger.info("Prompt on session %s: %s", session_id, user_text[:100] if user_text else "(image-only prompt)")
 
         conn = self._conn
         loop = asyncio.get_running_loop()
@@ -420,11 +675,20 @@ class HermesACPAgent(acp.Agent):
 
         def _run_agent() -> dict:
             try:
-                result = agent.run_conversation(
-                    user_message=user_text,
-                    conversation_history=state.history,
-                    task_id=session_id,
-                )
+                if isinstance(user_message_content, list):
+                    user_msg = {"role": "user", "content": user_message_content}
+                    state.history.append(user_msg)
+                    result = agent.run_conversation(
+                        user_message="",
+                        conversation_history=state.history,
+                        task_id=session_id,
+                    )
+                else:
+                    result = agent.run_conversation(
+                        user_message=user_message_content,
+                        conversation_history=state.history,
+                        task_id=session_id,
+                    )
                 return result
             except Exception as e:
                 logger.exception("Agent error in session %s", session_id)
@@ -442,16 +706,37 @@ class HermesACPAgent(acp.Agent):
         except Exception:
             logger.exception("Executor error for session %s", session_id)
             return PromptResponse(stop_reason="end_turn")
+        finally:
+            for fp in cleanup_paths:
+                try:
+                    os.unlink(fp)
+                except OSError:
+                    pass
 
         if result.get("messages"):
             state.history = result["messages"]
-            # Persist updated history so sessions survive process restarts.
             self.session_manager.save_session(session_id)
 
         final_response = result.get("final_response", "")
         if final_response and conn:
-            update = acp.update_agent_message_text(final_response)
-            await conn.session_update(session_id, update)
+            clean_text, images = _extract_markdown_images(final_response)
+            if clean_text:
+                update = acp.update_agent_message_text(clean_text)
+                await conn.session_update(session_id, update)
+            for alt, url in images:
+                try:
+                    if url.startswith(("http://", "https://")):
+                        block = acp.image_block(data="", mime_type="image/jpeg", uri=url)
+                    elif url.startswith("data:"):
+                        header, _, data = url.partition(",")
+                        mime = header.split(":", 1)[1].split(";", 1)[0] if ":" in header else "image/jpeg"
+                        block = acp.image_block(data=data, mime_type=mime)
+                    else:
+                        continue
+                    await conn.session_update(session_id, block)
+                    logger.info("Sent outbound image: %s", url[:80])
+                except Exception:
+                    logger.warning("Failed to send image block for %s", url[:80], exc_info=True)
 
         usage = None
         if any(result.get(key) is not None for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
