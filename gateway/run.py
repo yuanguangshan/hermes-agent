@@ -1099,17 +1099,46 @@ class GatewayRunner:
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
+    def _resolve_turn_agent_config(
+        self, user_message: str, model: str, runtime_kwargs: dict, platform: str = None
+    ) -> dict:
         """Build the effective model/runtime config for a single turn.
 
         Always uses the session's primary model/provider.  If `/fast` is
         enabled and the model supports Priority Processing / Anthropic fast
         mode, attach `request_overrides` so the API call is marked
         accordingly.
+
+        Optionally applies a platform-specific model/base_url/provider/api_key
+        override before evaluating fast-mode overrides.
         """
+        from agent.smart_model_routing import resolve_turn_route
         from hermes_cli.models import resolve_fast_mode_overrides
 
+        # Platform-specific model override (e.g. Telegram → Dashscope/Qwen
+        # to avoid GLM coding endpoint 1210 errors on full agent payloads).
+        if platform:
+            try:
+                _pmo = user_config.get("platform_model_overrides", {}) or {}
+                _plat_override = _pmo.get(platform) if isinstance(_pmo, dict) else None
+                if isinstance(_plat_override, dict):
+                    _ov_model = _plat_override.get("model")
+                    if _ov_model:
+                        model = _ov_model
+                    _ov_base = _plat_override.get("base_url")
+                    if _ov_base:
+                        runtime_kwargs = {**runtime_kwargs, "base_url": _ov_base}
+                    _ov_provider = _plat_override.get("provider")
+                    if _ov_provider:
+                        runtime_kwargs = {**runtime_kwargs, "provider": _ov_provider}
+                    _ov_key = _plat_override.get("api_key")
+                    if _ov_key:
+                        runtime_kwargs = {**runtime_kwargs, "api_key": _ov_key}
+            except Exception:
+                pass  # fail open — use global config
+
         runtime = {
+            "model": model,
             "api_key": runtime_kwargs.get("api_key"),
             "base_url": runtime_kwargs.get("base_url"),
             "provider": runtime_kwargs.get("provider"),
@@ -3496,6 +3525,9 @@ class GatewayRunner:
         if canonical == "personality":
             return await self._handle_personality_command(event)
 
+        if canonical == "search":
+            return await self._handle_search_command(event, command_alias=command)
+
         if canonical == "plan":
             try:
                 from agent.skill_commands import build_plan_path, build_skill_invocation_message
@@ -5773,7 +5805,99 @@ class GatewayRunner:
 
         available = "`none`, " + ", ".join(f"`{n}`" for n in personalities)
         return f"Unknown personality: `{args}`\n\nAvailable: {available}"
-    
+
+    # ------------------------------------------------------------------
+    # /search, /s, /sw, /sm — DDG multi-engine web search
+    # ------------------------------------------------------------------
+
+    _SEARCH_TIME_MAP = {
+        "s": "d",       # 24 hours
+        "sw": "w",      # 1 week
+        "sm": "m",      # 1 month
+        "search": None, # no limit
+    }
+
+    _SEARCH_TIME_LABELS = {
+        "d": "24小时内",
+        "w": "一周内",
+        "m": "一月内",
+        None: "无时间限制",
+    }
+
+    async def _handle_search_command(self, event: MessageEvent, *, command_alias: str = "search") -> str:
+        """Handle /s, /sw, /sm, /search — quick web search via DDG multi-engine."""
+        import asyncio
+        import sys
+
+        query = event.get_command_args().strip()
+        if not query:
+            return (
+                "❌ 请输入搜索关键词\n\n"
+                "用法：`/s 关键词`（24h）`/sw 关键词`（一周）\n"
+                "`/sm 关键词`（一月）`/search 关键词`（不限）"
+            )
+
+        # Resolve time limit from alias
+        time_limit = self._SEARCH_TIME_MAP.get(command_alias, None)
+        time_label = self._SEARCH_TIME_LABELS.get(time_limit, "无时间限制")
+
+        # Import DDG search (from skill)
+        skill_search_path = _hermes_home / "skills" / "ddg-html-search"
+        if not skill_search_path.exists():
+            return "❌ DDG 搜索技能未安装（缺少 ddg-html-search）"
+
+        sys.path.insert(0, str(skill_search_path))
+        try:
+            from ddg_search import MultiEngineSearch
+        finally:
+            sys.path.remove(str(skill_search_path))
+
+        # Run blocking search in executor
+        def _do_search():
+            searcher = MultiEngineSearch()
+            # DDG HTML supports time limit via df parameter
+            results = []
+            for engine in ("ddg", "bing"):
+                try:
+                    engine_results = searcher.search_engine(engine, query, max_pages=1)
+                    for r in engine_results:
+                        r["engine"] = searcher.ENGINES.get(engine, {}).get("name", engine)
+                    results.extend(engine_results)
+                except Exception:
+                    pass
+            # Dedup by URL
+            seen = set()
+            unique = []
+            for r in results:
+                if r["url"] not in seen:
+                    seen.add(r["url"])
+                    unique.append(r)
+            return unique[:8]
+
+        try:
+            results = await asyncio.get_event_loop().run_in_executor(None, _do_search)
+        except Exception as e:
+            return f"⚠️ 搜索出错：{e}"
+
+        if not results:
+            return f"❌ 未找到「{query}」的相关结果\n\n请尝试更换关键词或扩大时间范围（`/sw`、`/sm`）"
+
+        lines = [f"🔍 **{query}** ({time_label})\n"]
+        lines.append(f"找到 {len(results)} 条结果\n")
+        lines.append("| # | 标题 |")
+        lines.append("|---|------|")
+        for i, r in enumerate(results, 1):
+            title = r.get("title", "无标题")
+            url = r.get("url", "")
+            engine_tag = r.get("engine", "")
+            # Truncate long titles
+            if len(title) > 60:
+                title = title[:57] + "..."
+            lines.append(f"| {i} | [{title}]({url}) |")
+
+        lines.append(f"\n*DDG+Bing · {time_label}*")
+        return "\n".join(lines)
+
     async def _handle_retry_command(self, event: MessageEvent) -> str:
         """Handle /retry command - re-send the last user message."""
         source = event.source
@@ -6411,7 +6535,7 @@ class GatewayRunner:
             reasoning_config = self._load_reasoning_config()
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
-            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs, platform_key)
 
             def run_sync():
                 agent = AIAgent(
@@ -6578,7 +6702,7 @@ class GatewayRunner:
             platform_key = _platform_config_key(source.platform)
             reasoning_config = self._load_reasoning_config()
             self._service_tier = self._load_service_tier()
-            turn_route = self._resolve_turn_agent_config(question, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(question, model, runtime_kwargs, platform_key)
             pr = self._provider_routing
 
             # Snapshot history from running agent or stored transcript
@@ -9594,7 +9718,7 @@ class GatewayRunner:
                 except Exception as _e:
                     logger.debug("interim_assistant_callback error: %s", _e)
 
-            turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs, platform_key)
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
