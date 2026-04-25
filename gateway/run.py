@@ -1157,7 +1157,6 @@ class GatewayRunner:
         Optionally applies a platform-specific model/base_url/provider/api_key
         override before evaluating fast-mode overrides.
         """
-        from agent.smart_model_routing import resolve_turn_route
         from hermes_cli.models import resolve_fast_mode_overrides
 
         # Platform-specific model override (e.g. Telegram → Dashscope/Qwen
@@ -1183,7 +1182,6 @@ class GatewayRunner:
                 pass  # fail open — use global config
 
         runtime = {
-            "model": model,
             "api_key": runtime_kwargs.get("api_key"),
             "base_url": runtime_kwargs.get("base_url"),
             "provider": runtime_kwargs.get("provider"),
