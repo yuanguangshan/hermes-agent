@@ -19,9 +19,8 @@ format) lives there.
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 
 def hooks_command(args) -> None:
@@ -125,6 +124,7 @@ _DEFAULT_PAYLOADS = {
         "task_id": "test-task",
         "tool_call_id": "test-call",
         "result": '{"output": "hello"}',
+        "duration_ms": 42,
     },
     "pre_llm_call": {
         "session_id": "test-session",
@@ -205,7 +205,7 @@ def _cmd_test(args) -> None:
 
     if getattr(args, "payload_file", None):
         try:
-            custom = json.loads(Path(args.payload_file).read_text())
+            custom = json.loads(Path(args.payload_file).read_text(encoding="utf-8"))
             if isinstance(custom, dict):
                 payload.update(custom)
             else:
