@@ -1444,7 +1444,7 @@ def _try_payment_fallback(
             continue
         client, model = try_fn()
         if client is not None:
-            logger.info(
+            logger.debug(
                 "Auxiliary %s: %s on %s — falling back to %s (%s)",
                 task or "call", reason, failed_provider, label, model or "default",
             )
@@ -1526,7 +1526,7 @@ def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Option
             api_mode=runtime_api_mode or None,
         )
         if client is not None:
-            logger.info("Auxiliary auto-detect: using main provider %s (%s)",
+            logger.debug("Auxiliary auto-detect: using main provider %s (%s)",
                         main_provider, resolved or main_model)
             return client, resolved or main_model
 
@@ -1536,10 +1536,10 @@ def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Option
         client, model = try_fn()
         if client is not None:
             if tried:
-                logger.info("Auxiliary auto-detect: using %s (%s) — skipped: %s",
+                logger.debug("Auxiliary auto-detect: using %s (%s) — skipped: %s",
                             label, model or "default", ", ".join(tried))
             else:
-                logger.info("Auxiliary auto-detect: using %s (%s)", label, model or "default")
+                logger.debug("Auxiliary auto-detect: using %s (%s)", label, model or "default")
             return client, model
         tried.append(label)
     logger.warning("Auxiliary auto-detect: no provider available (tried: %s). "
@@ -2921,7 +2921,7 @@ def call_llm(
             # resolved_model may be an OpenRouter-format slug that doesn't
             # work on other providers.
             if not resolved_base_url:
-                logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
+                logger.debug("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
                 client, final_model = _get_cached_client("auto", main_runtime=main_runtime)
         if client is None:
@@ -2934,7 +2934,7 @@ def call_llm(
     # Log what we're about to do — makes auxiliary operations visible
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
     if task:
-        logger.info("Auxiliary %s: using %s (%s)%s",
+        logger.debug("Auxiliary %s: using %s (%s)%s",
                      task, resolved_provider or "auto", final_model or "default",
                      f" at {_base_info}" if _base_info and "openrouter" not in _base_info else "")
 
@@ -2987,7 +2987,7 @@ def call_llm(
                 main_runtime=main_runtime,
             )
             if refreshed_client is not None:
-                logger.info("Auxiliary %s: refreshed Nous runtime credentials after 401, retrying",
+                logger.debug("Auxiliary %s: refreshed Nous runtime credentials after 401, retrying",
                             task or "call")
                 if refreshed_model and refreshed_model != kwargs.get("model"):
                     kwargs["model"] = refreshed_model
@@ -3056,7 +3056,7 @@ def call_llm(
         is_auto = resolved_provider in ("auto", "", None)
         if should_fallback and is_auto:
             reason = "payment error" if _is_payment_error(first_err) else "connection error"
-            logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
+            logger.debug("Auxiliary %s: %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)
             fb_client, fb_model, fb_label = _try_payment_fallback(
                 resolved_provider, task, reason=reason)
@@ -3193,7 +3193,7 @@ async def async_call_llm(
                     f"variable, or switch to a different provider with `hermes model`."
                 )
             if not resolved_base_url:
-                logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
+                logger.debug("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
                 client, final_model = _get_cached_client("auto", async_mode=True)
         if client is None:
@@ -3250,7 +3250,7 @@ async def async_call_llm(
                 api_mode=resolved_api_mode,
             )
             if refreshed_client is not None:
-                logger.info("Auxiliary %s (async): refreshed Nous runtime credentials after 401, retrying",
+                logger.debug("Auxiliary %s (async): refreshed Nous runtime credentials after 401, retrying",
                             task or "call")
                 if refreshed_model and refreshed_model != kwargs.get("model"):
                     kwargs["model"] = refreshed_model
@@ -3304,7 +3304,7 @@ async def async_call_llm(
         is_auto = resolved_provider in ("auto", "", None)
         if should_fallback and is_auto:
             reason = "payment error" if _is_payment_error(first_err) else "connection error"
-            logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
+            logger.debug("Auxiliary %s (async): %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)
             fb_client, fb_model, fb_label = _try_payment_fallback(
                 resolved_provider, task, reason=reason)

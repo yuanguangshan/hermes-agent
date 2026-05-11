@@ -94,7 +94,25 @@ def _extract_text(
             parts.append(block.text)
         elif hasattr(block, "text"):
             parts.append(str(block.text))
-        # Non-text blocks are ignored for now.
+        elif isinstance(block, EmbeddedResourceContentBlock) and hasattr(block, "resource"):
+            # Embedded file: extract text content from TextResourceContents
+            resource = block.resource
+            if hasattr(resource, "text"):
+                parts.append(str(resource.text))
+            elif hasattr(resource, "blob"):
+                # Binary blob — record name/mime but skip raw data
+                name = getattr(resource, "uri", "unknown")
+                parts.append(f"[embedded file: {name}]")
+        elif hasattr(block, "uri"):
+            # ResourceLink — record the URI, note if it's an image
+            uri = getattr(block, "uri", "unknown")
+            name = getattr(block, "name", uri.split("/")[-1] if "/" in uri else uri)
+            is_image = name.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'))
+            if is_image:
+                parts.append(f"[image: {name} at {uri}]")
+            else:
+                parts.append(f"[file: {name} at {uri}]")
+        # Other non-text blocks are ignored.
     return "\n".join(parts)
 
 
